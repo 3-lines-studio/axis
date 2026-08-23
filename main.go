@@ -15,10 +15,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/yuin/goldmark"
@@ -98,8 +100,33 @@ func main() {
 	if address == "" {
 		address = "127.0.0.1:8081"
 	}
+	server := &http.Server{Addr: address, Handler: a.secure(mux)}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		a.cancelRuns()
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		server.Shutdown(shutdown)
+	}()
 	log.Printf("listening on %s", address)
-	log.Fatal(http.ListenAndServe(address, a.secure(mux)))
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
+}
+
+func (a *app) cancelRuns() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, run := range a.runs {
+		run.mu.Lock()
+		done := run.done
+		run.mu.Unlock()
+		if !done {
+			run.cancel()
+		}
+	}
 }
 
 func (a *app) secure(next http.Handler) http.Handler {
