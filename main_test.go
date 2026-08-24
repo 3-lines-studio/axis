@@ -149,3 +149,50 @@ func TestProjectSessionAPI(t *testing.T) {
 		t.Fatalf("metadata still exists: %v", err)
 	}
 }
+func TestDeleteProject(t *testing.T) {
+	root := t.TempDir()
+	a := app{
+		root:         root,
+		projectsPath: filepath.Join(root, "projects.json"),
+		projects:     []project{{ID: "test", Name: "Test", Path: root}},
+	}
+	if err := os.MkdirAll(filepath.Join(root, "sessions"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodDelete, "/api/projects/test", nil)
+	request.SetPathValue("id", "test")
+	response := httptest.NewRecorder()
+	a.deleteProject(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if len(a.projects) != 0 {
+		t.Fatalf("projects = %d", len(a.projects))
+	}
+}
+
+func TestDeleteProjectRejectsProjectWithSessions(t *testing.T) {
+	root := t.TempDir()
+	a := app{
+		root:         root,
+		projectsPath: filepath.Join(root, "projects.json"),
+		projects:     []project{{ID: "test", Name: "Test", Path: root}},
+	}
+	if err := os.MkdirAll(filepath.Join(root, "sessions"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := a.writeMetadata(metadata{ID: strings.Repeat("c", 24), ProjectID: "test", Title: "Chat", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodDelete, "/api/projects/test", nil)
+	request.SetPathValue("id", "test")
+	response := httptest.NewRecorder()
+	a.deleteProject(response, request)
+	if response.Code != http.StatusConflict {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if len(a.projects) != 1 {
+		t.Fatalf("projects = %d", len(a.projects))
+	}
+}

@@ -163,6 +163,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/projects", a.listProjects)
 	mux.HandleFunc("POST /api/projects", a.addProject)
+	mux.HandleFunc("DELETE /api/projects/{id}", a.deleteProject)
 	mux.HandleFunc("GET /api/directories", a.listDirectories)
 	mux.HandleFunc("GET /api/projects/{id}/sessions", a.listProjectSessions)
 	mux.HandleFunc("POST /api/projects/{id}/sessions", a.createProjectSession)
@@ -271,6 +272,43 @@ func (a *app) addProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, project{ID: item.ID, Name: item.Name})
+}
+
+func (a *app) deleteProject(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sessions, err := a.projectSessions(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(sessions) > 0 {
+		http.Error(w, "delete this project's chats first", http.StatusConflict)
+		return
+	}
+
+	a.projectsMu.Lock()
+	defer a.projectsMu.Unlock()
+	index := -1
+	for i, item := range a.projects {
+		if item.ID == id {
+			index = i
+			break
+		}
+	}
+	if index == -1 {
+		http.NotFound(w, r)
+		return
+	}
+	item := a.projects[index]
+	a.projects = append(a.projects[:index], a.projects[index+1:]...)
+	if err := a.writeProjects(); err != nil {
+		a.projects = append(a.projects, project{})
+		copy(a.projects[index+1:], a.projects[index:])
+		a.projects[index] = item
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *app) listDirectories(w http.ResponseWriter, r *http.Request) {
