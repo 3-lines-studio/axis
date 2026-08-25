@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -194,5 +195,101 @@ func TestDeleteProjectRejectsProjectWithSessions(t *testing.T) {
 	}
 	if len(a.projects) != 1 {
 		t.Fatalf("projects = %d", len(a.projects))
+	}
+}
+
+func TestBotAPI(t *testing.T) {
+	base := t.TempDir()
+	workspace := filepath.Join(base, "workspace")
+	skills := filepath.Join(base, "skills")
+	if err := os.MkdirAll(workspace, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(skills, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AX_TOOLS", "fsx skillx")
+	a := app{roots: []root{{Name: "Bots", Path: base}}, botsPath: filepath.Join(base, "bots.json")}
+	body := `{"name":"Alfred","prompt":"Be useful","tools":["skillx","fsx"],"workspace_root":"` + workspace + `","skill_root":"` + skills + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/api/bots", strings.NewReader(body))
+	response := httptest.NewRecorder()
+	a.addBot(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if len(a.bots) != 1 || a.bots[0].ID != "alfred" || strings.Join(a.bots[0].Tools, " ") != "fsx skillx" {
+		t.Fatalf("bots = %#v", a.bots)
+	}
+}
+
+func TestBotRejectsUnknownTool(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("AX_TOOLS", "fsx")
+	a := app{roots: []root{{Name: "Bots", Path: base}}, botsPath: filepath.Join(base, "bots.json")}
+	body := `{"name":"Alfred","prompt":"Be useful","tools":["bashx"],"workspace_root":"` + base + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/api/bots", strings.NewReader(body))
+	response := httptest.NewRecorder()
+	a.addBot(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d", response.Code)
+	}
+}
+
+func TestReadBotEnvironment(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, "alfred.env")
+	if err := os.WriteFile(path, []byte("DATABASE_URL=postgres://localhost/test\nTOKEN=\"quoted value\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a := app{botEnvDir: directory}
+	environment, err := a.readBotEnvironment("alfred")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(environment, "\n") != "DATABASE_URL=postgres://localhost/test\nTOKEN=quoted value" {
+		t.Fatalf("environment = %#v", environment)
+	}
+}
+
+func TestReadBotEnvironmentRejectsOpenPermissions(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.WriteFile(filepath.Join(directory, "alfred.env"), []byte("TOKEN=value\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	a := app{botEnvDir: directory}
+	if _, err := a.readBotEnvironment("alfred"); err == nil {
+		t.Fatal("accepted open permissions")
+	}
+}
+
+func TestBotEnvironmentOverridesSecretsAndProtectsWorkspace(t *testing.T) {
+	base := []string{"DATABASE_URL=old", "AX_TOOLS=wrong"}
+	secrets := []string{"DATABASE_URL=new", "AX_TOOLS=secret"}
+	definition := bot{Tools: []string{"fsx"}, WorkspaceRoot: "/workspace", SkillRoot: "/skills"}
+	environment := botEnvironment(overlayEnvironment(base, secrets), definition)
+	joined := strings.Join(environment, "\n")
+	if strings.Contains(joined, "DATABASE_URL=old") || !strings.Contains(joined, "DATABASE_URL=new") || !strings.Contains(joined, "AX_TOOLS=fsx") || strings.Contains(joined, "AX_TOOLS=secret") {
+		t.Fatalf("environment = %q", joined)
+	}
+}
+
+func TestConnectorAPI(t *testing.T) {
+	base := t.TempDir()
+	a := app{
+		root:             base,
+		bots:             []bot{{ID: "alfred", Name: "Alfred"}},
+		projects:         []project{{ID: "alfred", Name: "Alfred", Path: base}},
+		connectorsPath:   filepath.Join(base, "connectors.json"),
+		connectorCancels: make(map[string]context.CancelFunc),
+	}
+	body := `{"name":"Alfred Slack","type":"slack","bot_id":"alfred","project_id":"alfred","enabled":false}`
+	request := httptest.NewRequest(http.MethodPost, "/api/connectors", strings.NewReader(body))
+	response := httptest.NewRecorder()
+	a.addConnector(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
+	}
+	if len(a.connectors) != 1 || a.connectors[0].ID != "alfred-slack" {
+		t.Fatalf("connectors = %#v", a.connectors)
 	}
 }

@@ -40,6 +40,36 @@ type projectsConfig struct {
 	Projects []project `json:"projects"`
 }
 
+type bot struct {
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Prompt        string   `json:"prompt"`
+	Tools         []string `json:"tools"`
+	WorkspaceRoot string   `json:"workspace_root"`
+	SkillRoot     string   `json:"skill_root,omitempty"`
+	Model         string   `json:"model,omitempty"`
+}
+
+type botsConfig struct {
+	Bots []bot `json:"bots"`
+}
+
+type connector struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	BotID     string `json:"bot_id"`
+	ProjectID string `json:"project_id"`
+	Enabled   bool   `json:"enabled"`
+	Status    string `json:"status,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Restarts  int    `json:"restarts,omitempty"`
+}
+
+type connectorsConfig struct {
+	Connectors []connector `json:"connectors"`
+}
+
 type directory struct {
 	Name       string `json:"name"`
 	Path       string `json:"path"`
@@ -57,9 +87,17 @@ type directoryResponse struct {
 type metadata struct {
 	ID        string    `json:"id"`
 	ProjectID string    `json:"project_id"`
+	BotID     string    `json:"bot_id,omitempty"`
 	Title     string    `json:"title"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type artifact struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	MediaType string `json:"media_type"`
+	Size      int64  `json:"size"`
 }
 
 type toolCall struct {
@@ -90,7 +128,8 @@ type storedMessage struct {
 
 type sessionResponse struct {
 	metadata
-	Messages []message `json:"messages"`
+	Messages  []message  `json:"messages"`
+	Artifacts []artifact `json:"artifacts"`
 }
 
 type runEvent struct {
@@ -117,17 +156,27 @@ type run struct {
 }
 
 type app struct {
-	root         string
-	ax           string
-	username     string
-	password     string
-	projectsPath string
-	roots        []root
-	projects     []project
-	projectsMu   sync.RWMutex
-	mu           sync.Mutex
-	runs         map[string]*run
-	active       map[string]string
+	root             string
+	ax               string
+	username         string
+	password         string
+	projectsPath     string
+	roots            []root
+	projects         []project
+	projectsMu       sync.RWMutex
+	botsPath         string
+	botEnvDir        string
+	bots             []bot
+	botsMu           sync.RWMutex
+	connectorsPath   string
+	connectorEnvDir  string
+	connectors       []connector
+	connectorsMu     sync.Mutex
+	connectorCancels map[string]context.CancelFunc
+	connectorCtx     context.Context
+	mu               sync.Mutex
+	runs             map[string]*run
+	active           map[string]string
 }
 
 func main() {
@@ -143,16 +192,31 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	botsPath, bots, err := loadBots(roots)
+	if err != nil {
+		log.Fatal(err)
+	}
+	connectorsPath, connectors, err := loadConnectors()
+	if err != nil {
+		log.Fatal(err)
+	}
 	a := &app{
-		root:         root,
-		ax:           ax,
-		username:     os.Getenv("AXIS_USERNAME"),
-		password:     os.Getenv("AXIS_PASSWORD"),
-		projectsPath: projectsPath,
-		roots:        roots,
-		projects:     projects,
-		runs:         make(map[string]*run),
-		active:       make(map[string]string),
+		root:             root,
+		ax:               ax,
+		username:         os.Getenv("AXIS_USERNAME"),
+		password:         os.Getenv("AXIS_PASSWORD"),
+		projectsPath:     projectsPath,
+		roots:            roots,
+		projects:         projects,
+		botsPath:         botsPath,
+		botEnvDir:        botEnvironmentDirectory(),
+		bots:             bots,
+		connectorsPath:   connectorsPath,
+		connectorEnvDir:  connectorEnvironmentDirectory(),
+		connectors:       connectors,
+		connectorCancels: make(map[string]context.CancelFunc),
+		runs:             make(map[string]*run),
+		active:           make(map[string]string),
 	}
 	if a.password != "" && a.username == "" {
 		a.username = "axbot"
@@ -164,11 +228,21 @@ func main() {
 	mux.HandleFunc("GET /api/projects", a.listProjects)
 	mux.HandleFunc("POST /api/projects", a.addProject)
 	mux.HandleFunc("DELETE /api/projects/{id}", a.deleteProject)
+	mux.HandleFunc("GET /api/bots", a.listBots)
+	mux.HandleFunc("POST /api/bots", a.addBot)
+	mux.HandleFunc("GET /api/bots/{id}", a.getBot)
+	mux.HandleFunc("PUT /api/bots/{id}", a.updateBot)
+	mux.HandleFunc("DELETE /api/bots/{id}", a.deleteBot)
+	mux.HandleFunc("GET /api/connectors", a.listConnectors)
+	mux.HandleFunc("POST /api/connectors", a.addConnector)
+	mux.HandleFunc("PUT /api/connectors/{id}", a.updateConnector)
+	mux.HandleFunc("DELETE /api/connectors/{id}", a.deleteConnector)
 	mux.HandleFunc("GET /api/directories", a.listDirectories)
 	mux.HandleFunc("GET /api/projects/{id}/sessions", a.listProjectSessions)
 	mux.HandleFunc("POST /api/projects/{id}/sessions", a.createProjectSession)
 	mux.HandleFunc("GET /api/sessions/{id}", a.getSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", a.deleteSession)
+	mux.HandleFunc("GET /api/sessions/{id}/artifacts/{artifact}", a.getArtifact)
 	mux.HandleFunc("POST /sessions/{id}/messages", a.sendMessage)
 	mux.HandleFunc("GET /api/runs", a.listRuns)
 	mux.HandleFunc("GET /runs/{id}/events", a.streamRun)
@@ -180,6 +254,8 @@ func main() {
 	server := &http.Server{Addr: address, Handler: a.secure(mux)}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	a.connectorCtx = ctx
+	a.startConnectors(ctx)
 	go func() {
 		<-ctx.Done()
 		a.cancelRuns()
@@ -369,7 +445,22 @@ func (a *app) createProjectSession(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	session, err := a.newSession(item.ID)
+	var input struct {
+		BotID string `json:"bot_id"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid session", http.StatusBadRequest)
+			return
+		}
+	}
+	if input.BotID != "" {
+		if _, ok := a.bot(input.BotID); !ok {
+			http.Error(w, "bot not found", http.StatusBadRequest)
+			return
+		}
+	}
+	session, err := a.newSession(item.ID, input.BotID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -388,7 +479,12 @@ func (a *app) getSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionResponse{metadata: item, Messages: messages})
+	artifacts, err := a.readArtifacts(item.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, sessionResponse{metadata: item, Messages: messages, Artifacts: artifacts})
 }
 
 func (a *app) deleteSession(w http.ResponseWriter, r *http.Request) {
@@ -416,13 +512,13 @@ func (a *app) deleteSession(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (a *app) newSession(projectID string) (metadata, error) {
+func (a *app) newSession(projectID, botID string) (metadata, error) {
 	id, err := randomID()
 	if err != nil {
 		return metadata{}, err
 	}
 	now := time.Now().UTC()
-	item := metadata{ID: id, ProjectID: projectID, Title: "New chat", CreatedAt: now, UpdatedAt: now}
+	item := metadata{ID: id, ProjectID: projectID, BotID: botID, Title: "New chat", CreatedAt: now, UpdatedAt: now}
 	return item, a.writeMetadata(item)
 }
 
@@ -481,7 +577,30 @@ func (a *app) execute(ctx context.Context, run *run, prompt string) {
 		run.fail("project not found")
 		return
 	}
-	cmd := exec.CommandContext(ctx, a.ax, "-C", project.Path, "--events", "--session", filepath.Join(path, "session.jsonl"), prompt)
+	args := []string{"-C", project.Path}
+	var definition bot
+	if item.BotID != "" {
+		definition, ok = a.bot(item.BotID)
+		if !ok {
+			run.fail("bot not found")
+			return
+		}
+		args = append(args, "-system", definition.Prompt)
+		if definition.Model != "" {
+			args = append(args, "-model", definition.Model)
+		}
+	}
+	args = append(args, "--events", "--session", filepath.Join(path, "session.jsonl"), prompt)
+	cmd := exec.CommandContext(ctx, a.ax, args...)
+	cmd.Env = overlayEnvironment(os.Environ(), []string{"AX_ARTIFACT_DIR=" + filepath.Join(path, "artifacts")})
+	if item.BotID != "" {
+		environment, err := a.readBotEnvironment(item.BotID)
+		if err != nil {
+			run.fail(err.Error())
+			return
+		}
+		cmd.Env = botEnvironment(overlayEnvironment(cmd.Env, environment), definition)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		run.fail(err.Error())
@@ -517,6 +636,12 @@ func (a *app) execute(ctx context.Context, run *run, prompt string) {
 			run.publishValue("tool_delta", map[string]string{"id": event.ID, "text": event.Text})
 		case "tool_result":
 			run.publishValue("tool_result", map[string]string{"id": event.ID, "output": event.Output})
+			var result struct {
+				Artifact artifact `json:"artifact"`
+			}
+			if json.Unmarshal([]byte(event.Output), &result) == nil && result.Artifact.ID != "" {
+				run.publishValue("artifact", result.Artifact)
+			}
 		case "tool_done":
 			run.publishValue("tool_done", map[string]string{"id": event.ID})
 		}
