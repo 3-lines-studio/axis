@@ -1,5 +1,7 @@
 # Axis
 
+<p align="center"><img src=".github/ax.svg" width="96" height="96" alt="AX ecosystem"></p>
+
 API server for AX clients.
 
 ## Run

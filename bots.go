@@ -309,11 +309,13 @@ func overlayEnvironment(base, values []string) []string {
 
 func botEnvironment(base []string, definition bot) []string {
 	values := []string{
-		"AX_TOOLS=" + strings.Join(definition.Tools, " "),
 		"AX_WORKSPACE=" + definition.WorkspaceRoot,
 		"FSX_WORKSPACE=" + definition.WorkspaceRoot,
 		"BASHX_WORKSPACE=" + definition.WorkspaceRoot,
 		"SKILLX_ROOT=" + definition.SkillRoot,
+	}
+	if len(definition.Tools) > 0 {
+		values = append(values, "AX_TOOLS="+strings.Join(definition.Tools, " "))
 	}
 	return overlayEnvironment(base, values)
 }
