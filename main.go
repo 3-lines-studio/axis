@@ -159,6 +159,8 @@ type run struct {
 	session  string
 	cancel   context.CancelFunc
 	graceful func()
+	steer    func(string) error
+	writeMu  sync.Mutex
 	mu       sync.Mutex
 	events   []runEvent
 	sequence int
@@ -250,12 +252,15 @@ func main() {
 	mux.HandleFunc("PUT /api/connectors/{id}", a.updateConnector)
 	mux.HandleFunc("DELETE /api/connectors/{id}", a.deleteConnector)
 	mux.HandleFunc("GET /api/directories", a.listDirectories)
+	mux.HandleFunc("GET /api/commands", a.listCommands)
+	mux.HandleFunc("GET /api/projects/{id}/files", a.searchProjectFiles)
 	mux.HandleFunc("GET /api/projects/{id}/sessions", a.listProjectSessions)
 	mux.HandleFunc("POST /api/projects/{id}/sessions", a.createProjectSession)
 	mux.HandleFunc("GET /api/sessions/{id}", a.getSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", a.deleteSession)
 	mux.HandleFunc("GET /api/sessions/{id}/artifacts/{artifact}", a.getArtifact)
 	mux.HandleFunc("POST /sessions/{id}/messages", a.sendMessage)
+	mux.HandleFunc("POST /runs/{id}/steer", a.steerRun)
 	mux.HandleFunc("GET /api/runs", a.listRuns)
 	mux.HandleFunc("GET /runs/{id}/events", a.streamRun)
 	mux.HandleFunc("POST /runs/{id}/cancel", a.cancelRun)
@@ -589,7 +594,7 @@ func (a *app) execute(ctx context.Context, run *run, prompt string) {
 		run.fail("project not found")
 		return
 	}
-	args := []string{"-C", project.Path}
+	baseArgs := []string{"-C", project.Path}
 	var definition bot
 	if item.BotID != "" {
 		definition, ok = a.bot(item.BotID)
@@ -597,44 +602,73 @@ func (a *app) execute(ctx context.Context, run *run, prompt string) {
 			run.fail("bot not found")
 			return
 		}
-		args = append(args, "-system", definition.Prompt)
+		baseArgs = append(baseArgs, "-system", definition.Prompt)
 		if definition.Model != "" {
-			args = append(args, "-model", definition.Model)
+			baseArgs = append(baseArgs, "-model", definition.Model)
 		}
 	}
-	args = append(args, "--events", "--session", filepath.Join(path, "session.jsonl"), prompt)
-	cmd := exec.CommandContext(ctx, a.ax, args...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		run.fail(err.Error())
-		return
-	}
-	cmd.Env = overlayEnvironment(os.Environ(), []string{"AX_ARTIFACT_DIR=" + filepath.Join(path, "artifacts")})
+	baseArgs = append(baseArgs, "--events", "--session", filepath.Join(path, "session.jsonl"))
+	env := overlayEnvironment(os.Environ(), []string{"AX_ARTIFACT_DIR=" + filepath.Join(path, "artifacts")})
 	if item.BotID != "" {
 		environment, err := a.readBotEnvironment(item.BotID)
 		if err != nil {
 			run.fail(err.Error())
 			return
 		}
-		cmd.Env = botEnvironment(overlayEnvironment(cmd.Env, environment), definition)
+		env = botEnvironment(overlayEnvironment(env, environment), definition)
 	}
+	args := append(append([]string{}, baseArgs...), prompt)
+	outcome, failText := a.runOnce(ctx, run, args, env)
+	if failText == "" && outcome == "compact" {
+		if err := a.compactSession(ctx, filepath.Join(path, "session.jsonl"), definition.Model); err != nil {
+			run.fail("compaction failed: " + err.Error())
+			return
+		}
+		args = append(append([]string{}, baseArgs...), "--continue")
+		outcome, failText = a.runOnce(ctx, run, args, env)
+	}
+	if failText != "" {
+		run.fail(failText)
+		return
+	}
+	item, err = a.readMetadata(run.session)
+	if err == nil {
+		if item.Title == "New chat" {
+			item.Title = prompt
+			if len([]rune(item.Title)) > 48 {
+				item.Title = string([]rune(item.Title)[:48]) + "…"
+			}
+		}
+		item.UpdatedAt = time.Now().UTC()
+		a.writeMetadata(item)
+	}
+	run.finish()
+}
+
+func (a *app) runOnce(ctx context.Context, run *run, args []string, env []string) (string, string) {
+	cmd := exec.CommandContext(ctx, a.ax, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return "", err.Error()
+	}
+	cmd.Env = env
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		run.fail(err.Error())
-		return
+		return "", err.Error()
 	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		stdin.Close()
-		run.fail(err.Error())
-		return
+		return "", err.Error()
 	}
 	cancelOnce := sync.Once{}
 	run.mu.Lock()
 	run.graceful = func() {
 		cancelOnce.Do(func() {
+			run.writeMu.Lock()
 			_, _ = io.WriteString(stdin, "{\"type\":\"cancel\"}\n")
+			run.writeMu.Unlock()
 			stdin.Close()
 			go func() {
 				time.Sleep(5 * time.Second)
@@ -642,7 +676,24 @@ func (a *app) execute(ctx context.Context, run *run, prompt string) {
 			}()
 		})
 	}
+	run.steer = func(text string) error {
+		run.mu.Lock()
+		done := run.done
+		run.mu.Unlock()
+		if done {
+			return errors.New("run already finished")
+		}
+		data, err := json.Marshal(map[string]string{"type": "steer", "text": text})
+		if err != nil {
+			return err
+		}
+		run.writeMu.Lock()
+		defer run.writeMu.Unlock()
+		_, err = io.WriteString(stdin, string(data)+"\n")
+		return err
+	}
 	run.mu.Unlock()
+	outcome := ""
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
 	for scanner.Scan() {
@@ -662,6 +713,15 @@ func (a *app) execute(ctx context.Context, run *run, prompt string) {
 			}
 			_ = json.Unmarshal(scanner.Bytes(), &usage)
 			run.publishValue("usage", sessionUsage{Input: usage.Input, Output: usage.Output, CachedInput: usage.Cached, Window: usage.Window, Model: usage.Model})
+			continue
+		}
+		if kind.Type == "done" {
+			var done struct {
+				Outcome string `json:"outcome"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &done) == nil {
+				outcome = done.Outcome
+			}
 			continue
 		}
 		var event struct {
@@ -702,21 +762,49 @@ func (a *app) execute(ctx context.Context, run *run, prompt string) {
 		if text == "" {
 			text = err.Error()
 		}
-		run.fail(text)
-		return
+		return "", text
 	}
-	item, err = a.readMetadata(run.session)
-	if err == nil {
-		if item.Title == "New chat" {
-			item.Title = prompt
-			if len([]rune(item.Title)) > 48 {
-				item.Title = string([]rune(item.Title)[:48]) + "…"
-			}
+	return outcome, ""
+}
+
+func (a *app) compactSession(ctx context.Context, path, model string) error {
+	args := []string{"--compact", path}
+	if model != "" {
+		args = append(args, "-model", model)
+	}
+	cmd := exec.CommandContext(ctx, a.ax, args...)
+	output, err := cmd.Output()
+	if err != nil {
+		if exit, ok := err.(*exec.ExitError); ok && len(exit.Stderr) > 0 {
+			return errors.New(string(exit.Stderr))
 		}
-		item.UpdatedAt = time.Now().UTC()
-		a.writeMetadata(item)
+		return err
 	}
-	run.finish()
+	var result struct {
+		Summary      string          `json:"summary"`
+		TokensBefore int             `json:"tokens_before"`
+		Retained     json.RawMessage `json:"retained"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return err
+	}
+	line, err := json.Marshal(map[string]any{
+		"type":          "compaction",
+		"summary":       result.Summary,
+		"tokens_before": result.TokensBefore,
+		"timestamp":     time.Now().UnixMilli(),
+		"retained":      result.Retained,
+	})
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.Write(append(line, '\n'))
+	return err
 }
 
 func (run *run) publish(kind, value string) {
@@ -859,6 +947,42 @@ func (a *app) cancelRun(w http.ResponseWriter, r *http.Request) {
 		graceful()
 	} else {
 		cancel()
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *app) steerRun(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
+	var input struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "invalid steer", http.StatusBadRequest)
+		return
+	}
+	input.Text = strings.TrimSpace(input.Text)
+	if input.Text == "" || len(input.Text) > 10000 {
+		http.Error(w, "text must contain 1 to 10000 bytes", http.StatusBadRequest)
+		return
+	}
+	a.mu.Lock()
+	run := a.runs[r.PathValue("id")]
+	a.mu.Unlock()
+	if run == nil {
+		http.NotFound(w, r)
+		return
+	}
+	run.mu.Lock()
+	steer := run.steer
+	done := run.done
+	run.mu.Unlock()
+	if done || steer == nil {
+		http.Error(w, "run is not running", http.StatusConflict)
+		return
+	}
+	if err := steer(input.Text); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

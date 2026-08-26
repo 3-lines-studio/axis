@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -62,6 +63,47 @@ func TestRunReplaysEvents(t *testing.T) {
 	run.finish()
 	if len(run.events) != 2 {
 		t.Fatalf("events = %d", len(run.events))
+	}
+}
+
+func TestSteerRunWritesControlLine(t *testing.T) {
+	var sink bytes.Buffer
+	item := &run{watchers: make(map[chan runEvent]struct{})}
+	item.steer = func(text string) error {
+		data, err := json.Marshal(map[string]string{"type": "steer", "text": text})
+		if err != nil {
+			return err
+		}
+		_, err = sink.WriteString(string(data) + "\n")
+		return err
+	}
+	a := app{root: t.TempDir(), runs: map[string]*run{"r1": item}}
+
+	body := strings.NewReader(`{"text":"focus on the parser"}`)
+	request := httptest.NewRequest(http.MethodPost, "/runs/r1/steer", body)
+	request.SetPathValue("id", "r1")
+	response := httptest.NewRecorder()
+	a.steerRun(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", response.Code)
+	}
+	var control map[string]string
+	if err := json.Unmarshal(bytes.TrimSpace(sink.Bytes()), &control); err != nil {
+		t.Fatal(err)
+	}
+	if control["type"] != "steer" || control["text"] != "focus on the parser" {
+		t.Fatalf("control = %v", control)
+	}
+}
+
+func TestSteerRunRejectsMissingRun(t *testing.T) {
+	a := app{root: t.TempDir(), runs: map[string]*run{}}
+	request := httptest.NewRequest(http.MethodPost, "/runs/missing/steer", strings.NewReader(`{"text":"hi"}`))
+	request.SetPathValue("id", "missing")
+	response := httptest.NewRecorder()
+	a.steerRun(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", response.Code)
 	}
 }
 
@@ -375,5 +417,115 @@ done
 	run.mu.Unlock()
 	if status != "done" {
 		t.Fatalf("status = %q", status)
+	}
+}
+
+func TestListCommandsReadsAxCommands(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	commands := filepath.Join(dir, "ax", "commands")
+	if err := os.MkdirAll(commands, 0700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(commands, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("commit.md", "---\ndescription: stage and commit\n---\n\nstage everything")
+	write("note.md", "plain note body")
+	write("ignored.txt", "not markdown")
+	if err := os.MkdirAll(filepath.Join(commands, "sub.md"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	a := app{}
+	request := httptest.NewRequest(http.MethodGet, "/api/commands", nil)
+	response := httptest.NewRecorder()
+	a.listCommands(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	var items []userCommand
+	if err := json.NewDecoder(response.Body).Decode(&items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %v", items)
+	}
+	if items[0].Name != "commit" || items[0].Description != "stage and commit" {
+		t.Fatalf("commit = %+v", items[0])
+	}
+	if items[1].Name != "note" || items[1].Description != "plain note body" {
+		t.Fatalf("note = %+v", items[1])
+	}
+}
+
+func TestListCommandsMissingDirectoryIsEmpty(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	a := app{}
+	request := httptest.NewRequest(http.MethodGet, "/api/commands", nil)
+	response := httptest.NewRecorder()
+	a.listCommands(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	body := strings.TrimSpace(response.Body.String())
+	if body != "[]" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestSearchProjectFiles(t *testing.T) {
+	base := t.TempDir()
+	write := func(rel, content string) {
+		path := filepath.Join(base, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("main.go", "package main")
+	write("internal/parser/parse.go", "package parser")
+	write("internal/node_modules/skip.js", "skip")
+	a := app{projects: []project{{ID: "test", Name: "Test", Path: base}}}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/projects/test/files?q=par", nil)
+	request.SetPathValue("id", "test")
+	response := httptest.NewRecorder()
+	a.searchProjectFiles(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	var hits []fileHit
+	if err := json.NewDecoder(response.Body).Decode(&hits); err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, hit := range hits {
+		paths = append(paths, hit.Path)
+	}
+	found := strings.Join(paths, ",")
+	if !strings.Contains(found, "internal/parser/parse.go") {
+		t.Fatalf("paths = %q", found)
+	}
+	if strings.Contains(found, "node_modules") {
+		t.Fatalf("node_modules leaked: %q", found)
+	}
+	if strings.Contains(found, "main.go") {
+		t.Fatalf("unmatched file leaked: %q", found)
+	}
+}
+
+func TestSearchProjectFilesUnknownProject(t *testing.T) {
+	a := app{}
+	request := httptest.NewRequest(http.MethodGet, "/api/projects/missing/files?q=x", nil)
+	request.SetPathValue("id", "missing")
+	response := httptest.NewRecorder()
+	a.searchProjectFiles(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d", response.Code)
 	}
 }
