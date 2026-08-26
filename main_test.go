@@ -293,3 +293,87 @@ func TestConnectorAPI(t *testing.T) {
 		t.Fatalf("connectors = %#v", a.connectors)
 	}
 }
+
+func TestCancelRunEndsGracefully(t *testing.T) {
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, "sessions"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	session := strings.Repeat("c", 24)
+	if err := os.MkdirAll(filepath.Join(base, "sessions", session), 0700); err != nil {
+		t.Fatal(err)
+	}
+	axPath := filepath.Join(base, "ax.sh")
+	script := `#!/bin/sh
+printf '%s\n' '{"type":"protocol","version":1}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" > "` + base + `/stdin.txt"
+  printf '%s\n' '{"type":"done","outcome":"cancelled"}'
+  exit 0
+done
+`
+	if err := os.WriteFile(axPath, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	a := app{
+		root:   base,
+		ax:     axPath,
+		runs:   make(map[string]*run),
+		active: map[string]string{},
+	}
+	now := time.Now().UTC()
+	if err := a.writeMetadata(metadata{ID: session, ProjectID: "p", Title: "T", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	a.projects = []project{{ID: "p", Name: "P", Path: base}}
+	a.active = make(map[string]string)
+	a.runs = make(map[string]*run)
+	finished := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	run := &run{id: "r1", session: session, cancel: cancel, status: "running", watchers: make(map[chan runEvent]struct{})}
+	a.runs["r1"] = run
+	a.active[session] = "r1"
+	go func() {
+		a.execute(ctx, run, "hello")
+		close(finished)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		run.mu.Lock()
+		gracefulSet := run.graceful != nil
+		run.mu.Unlock()
+		if gracefulSet {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("run never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/runs/r1/cancel", nil)
+	request.SetPathValue("id", "r1")
+	response := httptest.NewRecorder()
+	a.cancelRun(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("cancel status = %d", response.Code)
+	}
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not finish after cancel")
+	}
+	data, err := os.ReadFile(filepath.Join(base, "stdin.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(data)) != `{"type":"cancel"}` {
+		t.Fatalf("stdin = %q", string(data))
+	}
+	run.mu.Lock()
+	status := run.status
+	run.mu.Unlock()
+	if status != "done" {
+		t.Fatalf("status = %q", status)
+	}
+}

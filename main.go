@@ -147,6 +147,7 @@ type run struct {
 	id       string
 	session  string
 	cancel   context.CancelFunc
+	graceful func()
 	mu       sync.Mutex
 	events   []runEvent
 	sequence int
@@ -592,6 +593,11 @@ func (a *app) execute(ctx context.Context, run *run, prompt string) {
 	}
 	args = append(args, "--events", "--session", filepath.Join(path, "session.jsonl"), prompt)
 	cmd := exec.CommandContext(ctx, a.ax, args...)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		run.fail(err.Error())
+		return
+	}
 	cmd.Env = overlayEnvironment(os.Environ(), []string{"AX_ARTIFACT_DIR=" + filepath.Join(path, "artifacts")})
 	if item.BotID != "" {
 		environment, err := a.readBotEnvironment(item.BotID)
@@ -609,9 +615,23 @@ func (a *app) execute(ctx context.Context, run *run, prompt string) {
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
+		stdin.Close()
 		run.fail(err.Error())
 		return
 	}
+	cancelOnce := sync.Once{}
+	run.mu.Lock()
+	run.graceful = func() {
+		cancelOnce.Do(func() {
+			_, _ = io.WriteString(stdin, "{\"type\":\"cancel\"}\n")
+			stdin.Close()
+			go func() {
+				time.Sleep(5 * time.Second)
+				run.cancel()
+			}()
+		})
+	}
+	run.mu.Unlock()
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
 	for scanner.Scan() {
@@ -647,6 +667,7 @@ func (a *app) execute(ctx context.Context, run *run, prompt string) {
 		}
 	}
 	err = cmd.Wait()
+	stdin.Close()
 	if err != nil {
 		text := strings.TrimSpace(stderr.String())
 		if text == "" {
@@ -796,8 +817,21 @@ func (a *app) cancelRun(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	run.cancel()
-	w.WriteHeader(204)
+	run.mu.Lock()
+	graceful := run.graceful
+	cancel := run.cancel
+	done := run.done
+	run.mu.Unlock()
+	if done {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if graceful != nil {
+		graceful()
+	} else {
+		cancel()
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *app) projectSessions(projectID string) ([]metadata, error) {
