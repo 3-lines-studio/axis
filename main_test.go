@@ -80,7 +80,7 @@ func TestReadMessagesIncludesToolCalls(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(path, "session.jsonl"), []byte(data), 0600); err != nil {
 		t.Fatal(err)
 	}
-	messages, err := a.readMessages(id)
+	messages, _, err := a.readMessages(id)
 	if err != nil {
 		t.Fatal(err)
 	}

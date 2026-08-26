@@ -128,8 +128,19 @@ type storedMessage struct {
 
 type sessionResponse struct {
 	metadata
-	Messages  []message  `json:"messages"`
-	Artifacts []artifact `json:"artifacts"`
+	Messages  []message     `json:"messages"`
+	Artifacts []artifact    `json:"artifacts"`
+	Usage     *sessionUsage `json:"usage,omitempty"`
+}
+
+type sessionUsage struct {
+	Input         int    `json:"input"`
+	Output        int    `json:"output"`
+	CachedInput   int    `json:"cached_input"`
+	ContextInput  int    `json:"context_input"`
+	ContextOutput int    `json:"context_output"`
+	Window        int    `json:"window,omitempty"`
+	Model         string `json:"model,omitempty"`
 }
 
 type runEvent struct {
@@ -475,7 +486,7 @@ func (a *app) getSession(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	messages, err := a.readMessages(item.ID)
+	messages, usage, err := a.readMessages(item.ID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -485,7 +496,7 @@ func (a *app) getSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionResponse{metadata: item, Messages: messages, Artifacts: artifacts})
+	writeJSON(w, http.StatusOK, sessionResponse{metadata: item, Messages: messages, Artifacts: artifacts, Usage: usage})
 }
 
 func (a *app) deleteSession(w http.ResponseWriter, r *http.Request) {
@@ -635,6 +646,24 @@ func (a *app) execute(ctx context.Context, run *run, prompt string) {
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
 	for scanner.Scan() {
+		var kind struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &kind) != nil {
+			continue
+		}
+		if kind.Type == "usage" {
+			var usage struct {
+				Input  int    `json:"input"`
+				Output int    `json:"output"`
+				Cached int    `json:"cached_input"`
+				Window int    `json:"window"`
+				Model  string `json:"model"`
+			}
+			_ = json.Unmarshal(scanner.Bytes(), &usage)
+			run.publishValue("usage", sessionUsage{Input: usage.Input, Output: usage.Output, CachedInput: usage.Cached, Window: usage.Window, Model: usage.Model})
+			continue
+		}
 		var event struct {
 			Type      string `json:"type"`
 			ID        string `json:"id"`
@@ -864,20 +893,21 @@ func (a *app) sessions() ([]metadata, error) {
 	return items, nil
 }
 
-func (a *app) readMessages(id string) ([]message, error) {
+func (a *app) readMessages(id string) ([]message, *sessionUsage, error) {
 	path, err := a.sessionPath(id)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	file, err := os.Open(filepath.Join(path, "session.jsonl"))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer file.Close()
 	var messages []message
+	var usage *sessionUsage
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		var entry struct {
@@ -885,6 +915,19 @@ func (a *app) readMessages(id string) ([]message, error) {
 			Message storedMessage `json:"message"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &entry) != nil || entry.Type != "message" {
+			var saved struct {
+				Type          string `json:"type"`
+				Input         int    `json:"input"`
+				Output        int    `json:"output"`
+				CachedInput   int    `json:"cached_input"`
+				ContextInput  int    `json:"context_input"`
+				ContextOutput int    `json:"context_output"`
+				Window        int    `json:"window"`
+				Model         string `json:"model"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &saved) == nil && saved.Type == "usage" {
+				usage = &sessionUsage{Input: saved.Input, Output: saved.Output, CachedInput: saved.CachedInput, ContextInput: saved.ContextInput, ContextOutput: saved.ContextOutput, Window: saved.Window, Model: saved.Model}
+			}
 			continue
 		}
 		item := message{Role: entry.Message.Role, Content: entry.Message.Content, ToolCallID: entry.Message.ToolCallID}
@@ -893,7 +936,7 @@ func (a *app) readMessages(id string) ([]message, error) {
 		}
 		messages = append(messages, item)
 	}
-	return messages, scanner.Err()
+	return messages, usage, scanner.Err()
 }
 
 func (a *app) sessionPath(id string) (string, error) {
